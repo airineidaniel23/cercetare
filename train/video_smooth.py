@@ -1,0 +1,125 @@
+import cv2
+import numpy as np
+import os
+from math import radians, sin, cos, atan2, pi
+
+# Paths to the folders (Update the paths)
+frames_folder = 'testFrames/1'  # Ensure this path is correct
+movement_folder = 'testInferred/1'
+output_video = 'output_video.mp4'
+
+# Get all frame files and corresponding movement data
+frame_files = sorted([f for f in os.listdir(frames_folder) if f.endswith('.jpg')])  # Assuming frames are JPG
+movement_files = sorted([f for f in os.listdir(movement_folder) if f.endswith('.txt')])
+
+# Check if the folder contains images
+if len(frame_files) == 0:
+    raise ValueError(f"No image files found in the directory: {frames_folder}")
+
+# Check if the folder contains any txt files
+if len(movement_files) == 0:
+    print(f"No movement files found in the directory: {movement_folder}. All frames will use default rotation.")
+
+# Load the first frame to get dimensions
+first_frame = cv2.imread(os.path.join(frames_folder, frame_files[0]))
+if first_frame is None:
+    raise ValueError(f"Unable to load the first image: {frame_files[0]}")
+
+height, width, layers = first_frame.shape
+
+# Set up video writer
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+video_writer = cv2.VideoWriter(output_video, fourcc, 30, (width, height))
+
+# Function to draw the compass and highlight the correct sector based on one-hot encoding
+def draw_compass_with_highlight(img, center, size, sector_index, highlight_color=(0, 0, 255), normal_color=(200, 200, 200)):
+    num_sectors = 8  # Number of compass directions (N, NE, E, SE, S, SW, W, NW)
+    sector_angle = 360 / num_sectors  # Each sector spans 45 degrees
+    sector_offset = 22.5  # Offset to rotate the sectors correctly
+
+    # Calculate triangle points for each sector
+    directions = []
+    for i in range(num_sectors):
+        # The angle for this sector in radians
+        theta = radians(i * sector_angle + 2 * sector_offset)
+        # The direction points are drawn relative to the center
+        direction = [
+            (int(center[0] + size * cos(theta)), int(center[1] + size * sin(theta))),  # Large outer point (points outward)
+            (int(center[0] + size * 0.6 * cos(theta + pi / 8)), int(center[1] + size * 0.6 * sin(theta + pi / 8))),  # Small inner point
+            (int(center[0] + size * 0.6 * cos(theta - pi / 8)), int(center[1] + size * 0.6 * sin(theta - pi / 8)))  # Small inner point
+        ]
+        directions.append(direction)
+
+    # Draw each triangle for the compass
+    for i, points in enumerate(directions):
+        color = highlight_color if i == sector_index else normal_color
+        cv2.fillPoly(img, [np.array(points)], color)
+
+# Function to smooth the direction over a window of 30 frames and ensure it falls within allowed sectors
+def smooth_direction(sector_indices, num_sectors=8):
+    if len(sector_indices) == 0:
+        return 2  # Default to sector 2 if no data available (since forward is not allowed)
+
+    # Convert sectors to vectors
+    vectors = np.array([np.exp(1j * 2 * pi * index / num_sectors) for index in sector_indices])
+
+    # Average the vectors
+    avg_vector = np.mean(vectors)
+
+    # Get the angle of the resulting vector
+    avg_angle = atan2(avg_vector.imag, avg_vector.real)
+
+    # Convert the angle back to a sector index (normalized between 0 and num_sectors)
+    avg_sector = int((avg_angle / (2 * pi) * num_sectors) % num_sectors)
+
+    # Restrict to sectors 2-6 only
+    if avg_sector in [0, 1, 2]:
+        return 3
+    
+    return avg_sector
+
+# Sliding window for smoothing
+window_size = 30
+direction_window = []
+
+# Loop through frames and movement files
+for i, frame_file in enumerate(frame_files):
+    # Load frame
+    frame = cv2.imread(os.path.join(frames_folder, frame_file))
+
+    if i < len(movement_files):
+        # Read the movement file and extract the one-hot encoding
+        with open(os.path.join(movement_folder, movement_files[i]), 'r') as f:
+            movement_data = f.readline().strip().split()
+            one_hot_encoding = list(map(int, movement_data[:8]))  # Assuming one-hot encoding is the first 8 values
+        
+        # Find the index of the sector with a 1 (it should only have one '1' in the list)
+        sector_index = one_hot_encoding.index(1)
+    else:
+        # If no more movement files, use a default sector index (for example, 2)
+        sector_index = 2
+
+    # Add the sector to the sliding window
+    direction_window.append(sector_index)
+
+    # Ensure the sliding window is no longer than 30 frames
+    if len(direction_window) > window_size:
+        direction_window.pop(0)
+
+    # Smooth the direction over the current window and cap the direction
+    smoothed_sector_index = smooth_direction(direction_window)
+
+    # Set the location for the circle in the lower right corner
+    circle_center = (width - 30, height - 30)  # Adjust these coordinates if needed
+    circle_radius = 25  # Adjust the radius size if needed
+
+    # Draw the compass with the highlighted smoothed sector
+    draw_compass_with_highlight(frame, circle_center, circle_radius, smoothed_sector_index)
+
+    # Write the frame with the highlighted sector to the video
+    video_writer.write(frame)
+
+# Release video writer
+video_writer.release()
+
+print("Video compilation with smoothed and capped sector highlighting completed.")
