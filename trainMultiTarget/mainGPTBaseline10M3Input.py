@@ -7,8 +7,8 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 from PIL import Image
 import matplotlib.pyplot as plt
-import pdb
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
+
 
 class FrameDataset(Dataset):
     def __init__(self, frames_folder, target_folder, transform=None):
@@ -35,7 +35,7 @@ class FrameDataset(Dataset):
         for parent_folder in sorted(os.listdir(self.frames_folder)):
             parent_folder_path = os.path.join(self.frames_folder, parent_folder)
             target_parent_folder_path = os.path.join(self.target_folder, parent_folder)
-            
+
             target_image_path = os.path.join(parent_folder_path, "target.jpg")
             if not os.path.exists(target_image_path):
                 raise FileNotFoundError(f"Target image not found: {target_image_path}")
@@ -45,14 +45,14 @@ class FrameDataset(Dataset):
                 for subfolder in sorted(os.listdir(parent_folder_path)):
                     frame_subfolder = os.path.join(parent_folder_path, subfolder)
                     target_subfolder = os.path.join(target_parent_folder_path, subfolder)
-                    
+
                     if os.path.isdir(frame_subfolder) and os.path.isdir(target_subfolder):
                         frames = sorted(os.listdir(frame_subfolder))
                         targets = sorted(os.listdir(target_subfolder))
-                        
+
                         if len(frames) != len(targets):
                             raise ValueError(f"Mismatched files in {frame_subfolder} and {target_subfolder}.")
-                        
+
                         data_groups.append([
                             (os.path.join(frame_subfolder, frame), os.path.join(target_subfolder, target))
                             for frame, target in zip(frames, targets)
@@ -85,12 +85,12 @@ class FrameDataset(Dataset):
         parent_folder = os.path.basename(os.path.dirname(os.path.dirname(frame_paths[0])))
         target_image_path = self.folder_targets[parent_folder]
         target_image = Image.open(target_image_path).convert("L")  # Grayscale
-        
+
         if self.transform:
             images = [self.transform(img) for img in images]
             target_image = self.transform(target_image)
 
-        # Concatenate images with target image
+        # Concatenate images with target image (add a channel to target before concat)
         target_image = target_image.expand(1, -1, -1)  # Add channel dimension
         image = torch.cat(images + [target_image], dim=0)
 
@@ -99,13 +99,16 @@ class FrameDataset(Dataset):
         with open(target_path, 'r') as file:
             target = np.array([int(x) for x in file.readline().strip().split()])
         target = np.argmax(target)
-        
+
         return image, target
+
 
 class CNNModel(nn.Module):
     def __init__(self):
         super(CNNModel, self).__init__()
-        self.conv1 = nn.Conv2d(10, 32, kernel_size=3, padding=1)  # Adjusted to 10 channels
+        # Adjusted to 10 input channels since we have 3 RGB frames + 1 grayscale = 4 total images
+        # The grayscale target image is expanded to a 1-channel, so total = 3 * 3 + 1 = 10 channels
+        self.conv1 = nn.Conv2d(10, 32, kernel_size=3, padding=1)  
         self.conv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.conv3 = nn.Conv2d(64, 128, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
@@ -142,6 +145,7 @@ def train_and_evaluate(model, train_loader, criterion, optimizer, epochs=8, num_
         for batch_idx, (images, labels) in enumerate(train_loader):
             images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
+
             outputs = model(images)
             loss = criterion(outputs, labels)
             loss.backward()
@@ -187,21 +191,26 @@ def train_and_evaluate(model, train_loader, criterion, optimizer, epochs=8, num_
 
     return train_losses, train_accuracies
 
+
 def plot_metrics(train_losses, train_accuracies):
     print("Plotting metrics...")
     plt.figure(figsize=(12, 5))
+    
     plt.subplot(1, 2, 1)
     plt.plot(train_losses, label="Train Loss")
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.legend()
+    
     plt.subplot(1, 2, 2)
     plt.plot(train_accuracies, label="Train Accuracy")
     plt.xlabel("Epochs")
     plt.ylabel("Accuracy")
     plt.legend()
+    
     plt.show()
     print("Metrics plotted.")
+
 
 def plot_confusion_matrix(model, data_loader, classes):
     print("Generating confusion matrix...")
@@ -224,27 +233,54 @@ def plot_confusion_matrix(model, data_loader, classes):
     plt.show()
     print("Confusion matrix plotted.")
 
+
 if __name__ == "__main__":
     print("Starting script...")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
     transform = transforms.Compose([
         transforms.Resize((128, 128)),
         transforms.ToTensor()
     ])
+
     print("Preparing dataset...")
     train_dataset = FrameDataset(frames_folder='frames', target_folder='target', transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     print(f"DataLoader created with {len(train_loader)} batches.")
+
     model = CNNModel().to(device)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total number of parameters: {total_params}")
-    criterion = nn.CrossEntropyLoss()
+
+    # -------------------------------------------
+    #  Define class weights for weighted loss
+    # -------------------------------------------
+    #  Classes 0,1,2 => 0.5
+    #  Class 5 => 1.0
+    #  Classes 3,4,6,7 => 4.0
+    class_weights = torch.tensor([0.5, 0.5, 0.5, 
+                                  4.0, 4.0, 
+                                  1.0, 
+                                  4.0, 4.0], 
+                                 dtype=torch.float32).to(device)
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+
     optimizer = optim.Adam(model.parameters(), lr=0.001)
+
     print("Starting training...")
-    train_losses, train_accuracies = train_and_evaluate(model, train_loader, criterion, optimizer, epochs=10)
+    train_losses, train_accuracies = train_and_evaluate(
+        model,
+        train_loader,
+        criterion,
+        optimizer,
+        epochs=6
+    )
+
     print("Training completed. Plotting results...")
     plot_metrics(train_losses, train_accuracies)
+
     classes = [f"Class {i}" for i in range(8)]
     plot_confusion_matrix(model, train_loader, classes)
     print("Script finished.")
